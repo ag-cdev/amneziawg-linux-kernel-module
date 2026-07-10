@@ -134,6 +134,43 @@
  *
  * If an error occurs, NLMSG_ERROR will reply containing an errno.
  *
+ * WG_CMD_GET_DEVICE_STATS
+ * ----------------------
+ *
+ * May only be called via NLM_F_REQUEST | NLM_F_DUMP. The command should contain
+ * one but not both of:
+ *
+ *    WGDEVICE_A_IFINDEX: NLA_U32
+ *    WGDEVICE_A_IFNAME: NLA_NUL_STRING, maxlen IFNAMSIZ - 1
+ *
+ * The kernel will then return several messages (NLM_F_MULTI) containing the
+ * following tree of nested items:
+ *
+ *    WGDEVICE_A_IFINDEX: NLA_U32
+ *    WGDEVICE_A_IFNAME: NLA_NUL_STRING, maxlen IFNAMSIZ - 1
+ *    WGDEVICE_A_PEERS: NLA_NESTED
+ *        0: NLA_NESTED
+ *            WGPEER_A_PUBLIC_KEY: NLA_EXACT_LEN, len WG_KEY_LEN
+ *            WGPEER_A_LAST_HANDSHAKE_TIME: NLA_EXACT_LEN, struct __kernel_timespec
+ *            WGPEER_A_RX_BYTES: NLA_U64
+ *            WGPEER_A_TX_BYTES: NLA_U64
+ *        0: NLA_NESTED
+ *            ...
+ *        ...
+ *
+ * Optionally, to restrict the reply to recently-active peers, include:
+ *
+ *    WGDEVICE_A_HANDSHAKE_CUTOFF: NLA_U32
+ *
+ * When present, only peers whose last handshake occurred within the last
+ * N seconds are included. This is intended for monitoring use cases at
+ * scale where only active peers are of interest.
+ *
+ * This is a lightweight alternative to WG_CMD_GET_DEVICE for monitoring
+ * use cases that only need runtime statistics and not static configuration.
+ * It omits all allowed IPs, endpoints, preshared keys, and other
+ * configuration fields.
+ *
  * WG_CMD_UNKNOWN_PEER
  * ----------------------
  *
@@ -168,6 +205,7 @@ enum wg_cmd {
 	WG_CMD_GET_DEVICE,
 	WG_CMD_SET_DEVICE,
 	WG_CMD_UNKNOWN_PEER,
+	WG_CMD_GET_DEVICE_STATS,
 	__WG_CMD_MAX
 };
 #define WG_CMD_MAX (__WG_CMD_MAX - 1)
@@ -203,6 +241,7 @@ enum wgdevice_attribute {
 	WGDEVICE_A_I3,
 	WGDEVICE_A_I4,
 	WGDEVICE_A_I5,
+	WGDEVICE_A_HANDSHAKE_CUTOFF,
 	__WGDEVICE_A_LAST
 };
 #define WGDEVICE_A_MAX (__WGDEVICE_A_LAST - 1)

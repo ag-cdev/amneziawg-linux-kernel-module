@@ -58,7 +58,8 @@ static const struct nla_policy device_policy[WGDEVICE_A_MAX + 1] = {
 	[WGDEVICE_A_I2]		= { .type = NLA_NUL_STRING },
 	[WGDEVICE_A_I3]		= { .type = NLA_NUL_STRING },
 	[WGDEVICE_A_I4]		= { .type = NLA_NUL_STRING },
-	[WGDEVICE_A_I5]		= { .type = NLA_NUL_STRING }
+	[WGDEVICE_A_I5]		= { .type = NLA_NUL_STRING },
+	[WGDEVICE_A_HANDSHAKE_CUTOFF]	= { .type = NLA_U32 }
 };
 
 static const struct nla_policy peer_policy[WGPEER_A_MAX + 1] = {
@@ -126,11 +127,34 @@ static int get_allowedips(struct sk_buff *skb, const u8 *ip, u8 cidr,
 	return 0;
 }
 
+/* Emit last handshake time, rx bytes, tx bytes into an already-open
+ * peer nest.  Returns 0 on success, -EMSGSIZE on failure.
+ * The caller is responsible for the peer nest framing and the public key.
+ */
+static int put_peer_stats_attrs(struct wg_peer *peer, struct sk_buff *skb)
+{
+	const struct __kernel_timespec last_handshake = {
+		.tv_sec = peer->walltime_last_handshake.tv_sec,
+		.tv_nsec = peer->walltime_last_handshake.tv_nsec
+	};
+
+	if (nla_put(skb, WGPEER_A_LAST_HANDSHAKE_TIME,
+		    sizeof(last_handshake), &last_handshake) ||
+	    nla_put_u64_64bit(skb, WGPEER_A_TX_BYTES, peer->tx_bytes,
+			      WGPEER_A_UNSPEC) ||
+	    nla_put_u64_64bit(skb, WGPEER_A_RX_BYTES, peer->rx_bytes,
+			      WGPEER_A_UNSPEC))
+		return -EMSGSIZE;
+
+	return 0;
+}
+
 struct dump_ctx {
 	struct wg_device *wg;
 	struct wg_peer *next_peer;
 	u64 allowedips_seq;
 	struct allowedips_node *next_allowedip;
+	u64 handshake_cutoff;
 };
 
 #define DUMP_CTX(cb) ((struct dump_ctx *)(cb)->args)
@@ -307,11 +331,6 @@ get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
 		goto err;
 
 	if (!allowedips_node) {
-		const struct __kernel_timespec last_handshake = {
-			.tv_sec = peer->walltime_last_handshake.tv_sec,
-			.tv_nsec = peer->walltime_last_handshake.tv_nsec
-		};
-
 		down_read(&peer->handshake.lock);
 		fail = nla_put(skb, WGPEER_A_PRESHARED_KEY,
 			       NOISE_SYMMETRIC_KEY_LEN,
@@ -320,14 +339,9 @@ get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
 		if (fail)
 			goto err;
 
-		if (nla_put(skb, WGPEER_A_LAST_HANDSHAKE_TIME,
-			    sizeof(last_handshake), &last_handshake) ||
+		if (put_peer_stats_attrs(peer, skb) ||
 		    nla_put_u16(skb, WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL,
 				peer->persistent_keepalive_interval) ||
-		    nla_put_u64_64bit(skb, WGPEER_A_TX_BYTES, peer->tx_bytes,
-				      WGPEER_A_UNSPEC) ||
-		    nla_put_u64_64bit(skb, WGPEER_A_RX_BYTES, peer->rx_bytes,
-				      WGPEER_A_UNSPEC) ||
 		    nla_put_u32(skb, WGPEER_A_PROTOCOL_VERSION, 1))
 			goto err;
 
@@ -536,6 +550,100 @@ static int wg_get_device_done(struct netlink_callback *cb)
 		dev_put(ctx->wg->dev);
 	wg_peer_put(ctx->next_peer);
 	return 0;
+}
+
+static int
+wg_get_device_stats_dump(struct sk_buff *skb, struct netlink_callback *cb)
+{
+	struct wg_peer *peer, *next_peer_cursor;
+	struct dump_ctx *ctx = DUMP_CTX(cb);
+	struct wg_device *wg = ctx->wg;
+	struct nlattr *peers_nest;
+	int ret = -EMSGSIZE;
+	bool done = true;
+	void *hdr;
+
+	rtnl_lock();
+	mutex_lock(&wg->device_update_lock);
+	cb->seq = wg->device_update_gen;
+	next_peer_cursor = ctx->next_peer;
+
+	hdr = genlmsg_put(skb, NETLINK_CB(cb->skb).portid, cb->nlh->nlmsg_seq,
+			  &genl_family, NLM_F_MULTI, WG_CMD_GET_DEVICE_STATS);
+	if (!hdr)
+		goto out;
+	genl_dump_check_consistent(cb, hdr);
+
+	if (!ctx->next_peer) {
+		if (nla_put_u32(skb, WGDEVICE_A_IFINDEX, wg->dev->ifindex) ||
+		    nla_put_string(skb, WGDEVICE_A_IFNAME, wg->dev->name))
+			goto out;
+		ctx->handshake_cutoff = 0;
+		if (genl_info_dump(cb)->attrs[WGDEVICE_A_HANDSHAKE_CUTOFF])
+			ctx->handshake_cutoff = ktime_get_real_seconds() -
+				nla_get_u32(genl_info_dump(cb)->attrs[
+					WGDEVICE_A_HANDSHAKE_CUTOFF]);
+	}
+
+	peers_nest = nla_nest_start(skb, WGDEVICE_A_PEERS);
+	if (!peers_nest)
+		goto out;
+	ret = 0;
+
+	if (list_empty(&wg->peer_list) ||
+	    (ctx->next_peer && ctx->next_peer->is_dead)) {
+		nla_nest_cancel(skb, peers_nest);
+		goto out;
+	}
+	peer = list_prepare_entry(ctx->next_peer, &wg->peer_list, peer_list);
+	list_for_each_entry_continue(peer, &wg->peer_list, peer_list) {
+		if (ctx->handshake_cutoff &&
+		    peer->walltime_last_handshake.tv_sec < ctx->handshake_cutoff)
+			continue;
+		struct nlattr *peer_nest = nla_nest_start(skb, 0);
+
+		if (!peer_nest) {
+			done = false;
+			break;
+		}
+		down_read(&peer->handshake.lock);
+		if (nla_put(skb, WGPEER_A_PUBLIC_KEY, NOISE_PUBLIC_KEY_LEN,
+			    peer->handshake.remote_static)) {
+			up_read(&peer->handshake.lock);
+			nla_nest_cancel(skb, peer_nest);
+			done = false;
+			break;
+		}
+		up_read(&peer->handshake.lock);
+
+		if (put_peer_stats_attrs(peer, skb)) {
+			nla_nest_cancel(skb, peer_nest);
+			done = false;
+			break;
+		}
+		nla_nest_end(skb, peer_nest);
+		next_peer_cursor = peer;
+	}
+	nla_nest_end(skb, peers_nest);
+
+out:
+	if (!ret && !done && next_peer_cursor)
+		wg_peer_get(next_peer_cursor);
+	wg_peer_put(ctx->next_peer);
+	mutex_unlock(&wg->device_update_lock);
+	rtnl_unlock();
+
+	if (ret) {
+		genlmsg_cancel(skb, hdr);
+		return ret;
+	}
+	genlmsg_end(skb, hdr);
+	if (done) {
+		ctx->next_peer = NULL;
+		return 0;
+	}
+	ctx->next_peer = next_peer_cursor;
+	return skb->len;
 }
 
 static int set_port(struct wg_device *wg, u16 port)
@@ -967,6 +1075,17 @@ struct genl_ops genl_ops[] = {
 	}, {
 		.cmd = WG_CMD_SET_DEVICE,
 		.doit = wg_set_device,
+#ifdef COMPAT_CANNOT_INDIVIDUAL_NETLINK_OPS_POLICY
+		.policy = device_policy,
+#endif
+		.flags = GENL_UNS_ADMIN_PERM
+	}, {
+		.cmd = WG_CMD_GET_DEVICE_STATS,
+#ifndef COMPAT_CANNOT_USE_NETLINK_START
+		.start = wg_get_device_start,
+#endif
+		.dumpit = wg_get_device_stats_dump,
+		.done = wg_get_device_done,
 #ifdef COMPAT_CANNOT_INDIVIDUAL_NETLINK_OPS_POLICY
 		.policy = device_policy,
 #endif
